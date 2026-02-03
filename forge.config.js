@@ -87,6 +87,8 @@ module.exports = {
       name: "@electron-forge/maker-squirrel",
       config: {
         name: "Codex",
+        authors: "OpenAI, Cometix Space",
+        description: "Codex Desktop App",
       },
     },
     // Windows ZIP
@@ -103,6 +105,7 @@ module.exports = {
           productName: "Codex",
           genericName: "AI Coding Assistant",
           categories: ["Development", "Utility"],
+          bin: "Codex",
         },
       },
     },
@@ -115,6 +118,7 @@ module.exports = {
           productName: "Codex",
           genericName: "AI Coding Assistant",
           categories: ["Development", "Utility"],
+          bin: "Codex",
         },
       },
     },
