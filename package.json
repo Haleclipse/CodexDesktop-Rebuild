@@ -8,7 +8,7 @@
     "start": "node scripts/start-dev.js",
     "dev": "node scripts/start-dev.js",
 
-    "patch": "node scripts/patch-copyright.js",
+    "patch": "node scripts/patch-copyright.js && node scripts/patch-i18n.js && node scripts/patch-process-polyfill.js",
 
     "forge:package": "electron-forge package",
     "forge:make": "npm run patch && electron-forge make",

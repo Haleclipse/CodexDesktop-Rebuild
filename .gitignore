@@ -35,3 +35,4 @@ Thumbs.db
 resources/bin/
 resources/codex
 resources/codex.exe
+.claude/

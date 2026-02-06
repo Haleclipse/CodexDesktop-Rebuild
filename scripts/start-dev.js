@@ -55,6 +55,9 @@ const child = spawn(electronBin, ['.'], {
   env: {
     ...process.env,
     CODEX_CLI_PATH: cliPath,
+    BUILD_FLAVOR: process.env.BUILD_FLAVOR || 'dev',
+    // 使用 app:// 自定义协议加载静态资源（而非 Vite dev server）
+    ELECTRON_RENDERER_URL: process.env.ELECTRON_RENDERER_URL || 'app://-/index.html',
   },
 });
 
