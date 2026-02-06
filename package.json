@@ -9,6 +9,8 @@
     "dev": "electron .",
 
     "patch": "node scripts/patch-copyright.js",
+    "patch:zh": "node scripts/patch-zh.js",
+    "build:zh": "npm run patch && npm run patch:zh && electron-forge make",
 
     "forge:package": "electron-forge package",
     "forge:make": "npm run patch && electron-forge make",
