@@ -7,7 +7,7 @@
  *   2. Replace codex binary with @cometix/codex version
  *   3. Copy everything to src/ for forge (app.asar + unpacked + resources)
  *
- * For Linux: strip macOS-only resources, add Linux codex from @cometix/codex
+ * For Linux: copy patched ASAR content into src/ and stage Linux-only resources.
  *
  * Usage:
  *   node scripts/prepare-src.js --platform mac-arm64
@@ -16,17 +16,15 @@
 const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
+const {
+  copyLinuxExecutable,
+  isMachO,
+  resolveCodexVendor,
+  resolveRipgrepVendor,
+} = require("./linux-native-utils");
 
 const SRC = path.join(__dirname, "..", "src");
 const PROJECT_ROOT = path.join(__dirname, "..");
-
-const TARGET_TRIPLE_MAP = {
-  "mac-arm64": "aarch64-apple-darwin",
-  "mac-x64": "x86_64-apple-darwin",
-  "linux-x64": "x86_64-unknown-linux-musl",
-  "linux-arm64": "aarch64-unknown-linux-musl",
-  "win": "x86_64-pc-windows-msvc",
-};
 
 // macOS-only resources to strip for Linux
 const MACOS_STRIP = new Set([
@@ -50,69 +48,217 @@ function copyRecursive(src, dest, skipFiles, skipDirs) {
   return count;
 }
 
-/**
- * Resolve codex CLI binary from @cometix/codex.
- * Tries node_modules first, falls back to npm pack + extract.
- */
-function resolveCodexVendor(platform) {
-  const triple = TARGET_TRIPLE_MAP[platform];
-  if (!triple) return null;
-  const isWin = platform === "win";
-  const binName = isWin ? "codex.exe" : "codex";
+function rmIfExists(target) {
+  if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
+}
 
-  // 1. Try platform-specific package (0.128+)
-  const PLAT_PKG = {
-    "linux-x64": "codex-linux-x64", "linux-arm64": "codex-linux-arm64",
-    "mac-arm64": "codex-darwin-arm64", "mac-x64": "codex-darwin-x64", "win": "codex-win32-x64",
-  };
-  const pkg = PLAT_PKG[platform];
-  if (pkg) {
-    const p = path.join(PROJECT_ROOT, "node_modules", "@cometix", pkg, "vendor", triple, "codex", binName);
-    if (fs.existsSync(p)) return p;
+function removeMachOFiles(dir, options = {}) {
+  let removed = 0;
+  if (!fs.existsSync(dir)) return removed;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (options.skipDirNames?.has(entry.name)) continue;
+    const target = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      removed += removeMachOFiles(target, options);
+      try {
+        if (fs.existsSync(target) && fs.readdirSync(target).length === 0) fs.rmdirSync(target);
+      } catch {}
+    } else if (entry.isFile() && isMachO(target)) {
+      fs.unlinkSync(target);
+      removed++;
+    }
   }
-  // 2. Try old-style vendor (pre-0.128)
-  const localPath = path.join(PROJECT_ROOT, "node_modules", "@cometix", "codex", "vendor", triple, "codex", binName);
-  if (fs.existsSync(localPath)) return localPath;
+  return removed;
+}
 
-  // 3. npm pack platform package
-  const PLAT_SUFFIX = {
-    "linux-x64": "linux-x64", "linux-arm64": "linux-arm64",
-    "mac-arm64": "darwin-arm64", "mac-x64": "darwin-x64", "win": "win32-x64",
-  };
-  const suffix = PLAT_SUFFIX[platform];
-  if (!suffix) return null;
+function removeNonLinuxPrebuilds(dir, platform) {
+  let removed = 0;
+  if (!fs.existsSync(dir)) return removed;
+  const keepLinuxArch = platform === "linux-arm64" ? "linux-arm64" : "linux-x64";
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const target = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === "prebuilds") {
+        for (const prebuild of fs.readdirSync(target, { withFileTypes: true })) {
+          const prebuildPath = path.join(target, prebuild.name);
+          if (prebuild.isDirectory() && prebuild.name !== keepLinuxArch) {
+            rmIfExists(prebuildPath);
+            removed++;
+          }
+        }
+      } else {
+        removed += removeNonLinuxPrebuilds(target, platform);
+      }
+    }
+  }
+  return removed;
+}
 
-  let baseVer;
-  try {
-    baseVer = execSync("npm view @cometix/codex version", { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
-  } catch { return null; }
-
-  const spec = `@cometix/codex@${baseVer}-${suffix}`;
-  console.log(`   [codex] fetching ${spec} via npm pack...`);
-  const tmpDir = path.join(require("os").tmpdir(), "cometix-codex-pack");
+function copyNpmPackageSource(moduleName, version, dest) {
+  const tmpDir = path.join(require("os").tmpdir(), "codex-native-source-pack", `${moduleName}-${version}`);
+  const extractDir = path.join(tmpDir, "extracted");
   fs.mkdirSync(tmpDir, { recursive: true });
 
-  try {
-    const tgzName = execSync(`npm pack ${spec} --pack-destination "${tmpDir}"`, {
-      cwd: tmpDir, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"],
-    }).trim().split("\n").pop();
+  console.log(`   [linux] fetching ${moduleName}@${version} source via npm pack...`);
+  const tgzName = execSync(`npm pack ${moduleName}@${version} --pack-destination "${tmpDir}"`, {
+    cwd: tmpDir,
+    encoding: "utf-8",
+    stdio: ["pipe", "pipe", "pipe"],
+  }).trim().split("\n").pop();
 
-    const extractDir = path.join(tmpDir, "extracted");
-    if (fs.existsSync(extractDir)) fs.rmSync(extractDir, { recursive: true });
-    fs.mkdirSync(extractDir, { recursive: true });
-    execSync(`tar xzf "${path.join(tmpDir, tgzName)}" -C "${extractDir}"`, { stdio: "pipe" });
+  rmIfExists(extractDir);
+  fs.mkdirSync(extractDir, { recursive: true });
+  execSync(`tar xzf "${path.join(tmpDir, tgzName)}" -C "${extractDir}"`, { stdio: "pipe" });
+  copyRecursive(path.join(extractDir, "package"), dest);
+}
 
-    const vendorPath = path.join(extractDir, "package", "vendor", triple, "codex", binName);
-    if (fs.existsSync(vendorPath)) return vendorPath;
-  } catch (e) {
-    console.log(`   [!] npm pack failed: ${e.message}`);
+function copyNativeSourceModule(moduleName) {
+  const source = path.join(PROJECT_ROOT, "node_modules", moduleName);
+  const dest = path.join(SRC, "node_modules", moduleName);
+  const runtimePkgPath = path.join(dest, "package.json");
+  const runtimeVersion = fs.existsSync(runtimePkgPath)
+    ? JSON.parse(fs.readFileSync(runtimePkgPath, "utf-8")).version
+    : null;
+  if (!runtimeVersion) {
+    console.error(`[x] Upstream runtime dependency not found: ${moduleName}`);
+    process.exit(1);
   }
 
-  return null;
+  let copiedFrom = null;
+  const sourcePkgPath = path.join(source, "package.json");
+  if (fs.existsSync(sourcePkgPath)) {
+    const sourceVersion = JSON.parse(fs.readFileSync(sourcePkgPath, "utf-8")).version;
+    if (sourceVersion === runtimeVersion) copiedFrom = source;
+  }
+
+  rmIfExists(dest);
+  if (copiedFrom) {
+    copyRecursive(copiedFrom, dest);
+  } else {
+    copyNpmPackageSource(moduleName, runtimeVersion, dest);
+  }
+  console.log(`   [linux] ${moduleName}: copied buildable sources (${runtimeVersion})`);
+}
+
+function stageLinuxResources(platform, sourceDir) {
+  const resourceDir = path.join(SRC, ".linux-resources", platform);
+  rmIfExists(resourceDir);
+  fs.mkdirSync(resourceDir, { recursive: true });
+
+  const skipFiles = new Set([
+    ...MACOS_STRIP,
+    "app.asar",
+    "codex",
+    "rg",
+  ]);
+  const skipDirs = new Set([
+    ...MACOS_STRIP_DIRS,
+    "_asar",
+    "app.asar.unpacked",
+  ]);
+  let resourceCount = 0;
+  for (const entry of fs.readdirSync(sourceDir, { withFileTypes: true })) {
+    if (entry.name.endsWith(".lproj")) continue;
+    if (skipFiles.has(entry.name) || skipDirs.has(entry.name)) continue;
+    const sourcePath = path.join(sourceDir, entry.name);
+    const destPath = path.join(resourceDir, entry.name);
+    if (entry.isDirectory()) resourceCount += copyRecursive(sourcePath, destPath);
+    else if (!entry.isSymbolicLink()) {
+      fs.copyFileSync(sourcePath, destPath);
+      resourceCount++;
+    }
+  }
+  const removed = removeMachOFiles(resourceDir);
+  const removedPrebuilds = removeNonLinuxPrebuilds(resourceDir, platform);
+  console.log(`   [linux] staged ${resourceCount} sanitized resource files (${removed} Mach-O, ${removedPrebuilds} non-target prebuild dirs removed)`);
+
+  const codex = resolveCodexVendor(platform);
+  if (!codex) {
+    console.error(`[x] Linux codex ELF not found for ${platform}`);
+    process.exit(1);
+  }
+  copyLinuxExecutable(codex, path.join(resourceDir, "codex"), platform, "codex");
+  console.log("   [linux] staged codex ELF");
+
+  const rg = resolveRipgrepVendor(platform);
+  if (!rg) {
+    console.error(`[x] Linux ripgrep ELF not found for ${platform}`);
+    process.exit(1);
+  }
+  copyLinuxExecutable(rg, path.join(resourceDir, "rg"), platform, "rg");
+  console.log("   [linux] staged rg ELF");
+}
+
+function stripLinuxMacArtifacts(linuxRoot) {
+  let removed = 0;
+  for (const name of MACOS_STRIP) {
+    const target = path.join(linuxRoot, name);
+    if (fs.existsSync(target)) {
+      rmIfExists(target);
+      removed++;
+    }
+  }
+  for (const name of MACOS_STRIP_DIRS) {
+    const target = path.join(linuxRoot, name);
+    if (fs.existsSync(target)) {
+      rmIfExists(target);
+      removed++;
+    }
+  }
+
+  const linuxNodeModules = path.join(linuxRoot, "node_modules");
+  const knownNativeStripPaths = [
+    path.join(linuxNodeModules, "better-sqlite3", "build", "Release", "better_sqlite3.node"),
+    path.join(linuxNodeModules, "node-pty", "build", "Release", "pty.node"),
+    path.join(linuxNodeModules, "node-pty", "build", "Release", "spawn-helper"),
+    path.join(linuxNodeModules, "node-pty", "prebuilds", "darwin-x64"),
+    path.join(linuxNodeModules, "node-pty", "prebuilds", "darwin-arm64"),
+    path.join(linuxNodeModules, "node-pty", "prebuilds", "win32-x64"),
+    path.join(linuxNodeModules, "node-pty", "prebuilds", "win32-arm64"),
+  ];
+
+  for (const target of knownNativeStripPaths) {
+    if (fs.existsSync(target)) {
+      rmIfExists(target);
+      removed++;
+    }
+  }
+
+  removed += removeMachOFiles(linuxRoot, { skipDirNames: new Set(["mac-arm64", "mac-x64"]) });
+
+  console.log(`   [linux] stripped ${removed} macOS-only native/resource paths`);
+}
+
+function stripLinuxNativeBuildExtras() {
+  let removed = 0;
+  const linuxNodeModules = path.join(SRC, "node_modules");
+  const stripPaths = [
+    path.join(linuxNodeModules, "node-pty", "prebuilds", "darwin-x64"),
+    path.join(linuxNodeModules, "node-pty", "prebuilds", "darwin-arm64"),
+    path.join(linuxNodeModules, "node-pty", "prebuilds", "win32-x64"),
+    path.join(linuxNodeModules, "node-pty", "prebuilds", "win32-arm64"),
+    path.join(linuxNodeModules, "node-pty", "build", "Release", "obj.target"),
+    path.join(linuxNodeModules, "better-sqlite3", "build", "Release", "obj.target"),
+    path.join(linuxNodeModules, "better-sqlite3", "build", "Release", "obj"),
+    path.join(linuxNodeModules, "better-sqlite3", "build", "Release", "test_extension.node"),
+  ];
+  for (const target of stripPaths) {
+    if (fs.existsSync(target)) {
+      rmIfExists(target);
+      removed++;
+    }
+  }
+  removed += removeMachOFiles(SRC, { skipDirNames: new Set(["mac-arm64", "mac-x64"]) });
+  console.log(`-- strip-linux-native-extras: removed ${removed} non-Linux/intermediate native paths`);
 }
 
 function main() {
   const args = process.argv.slice(2);
+  if (args.includes("--strip-linux-native-extras")) {
+    stripLinuxNativeBuildExtras();
+    return;
+  }
+
   const platIdx = args.indexOf("--platform");
   const platform = platIdx !== -1 ? args[platIdx + 1] : null;
 
@@ -141,24 +287,33 @@ function main() {
   console.log(`-- prepare-src: ${platform}`);
   console.log(`   source: ${path.relative(PROJECT_ROOT, sourceDir)}/`);
 
-  // 1. Repack _asar/ -> app.asar
-  const repackedAsar = path.join(sourceDir, "app.asar");
-  console.log("   [repack] _asar/ -> app.asar");
-  execSync(`npx asar pack "${asarContentDir}" "${repackedAsar}"`);
-  const asarSize = (fs.statSync(repackedAsar).size / 1048576).toFixed(1);
-  console.log(`   [ok] app.asar: ${asarSize} MB`);
+  // 1. Repack _asar/ -> app.asar for platforms that ship upstream Resources.
+  // Linux must let Electron Forge create app.asar/app.asar.unpacked from src/.
+  if (!isLinux) {
+    const repackedAsar = path.join(sourceDir, "app.asar");
+    console.log("   [repack] _asar/ -> app.asar");
+    execSync(`npx asar pack "${asarContentDir}" "${repackedAsar}"`);
+    const asarSize = (fs.statSync(repackedAsar).size / 1048576).toFixed(1);
+    console.log(`   [ok] app.asar: ${asarSize} MB`);
+  } else {
+    console.log("   [linux] Forge will pack app.asar from src/");
+  }
 
-  // 2. Replace codex binary with @cometix/codex
+  // 2. Replace or stage codex binary
   const isWin = platform === "win";
   const codexBinName = isWin ? "codex.exe" : "codex";
-  const vendorCodex = resolveCodexVendor(platform);
-  if (vendorCodex) {
-    const dest = path.join(sourceDir, codexBinName);
-    fs.copyFileSync(vendorCodex, dest);
-    try { fs.chmodSync(dest, 0o755); } catch {}
-    console.log(`   [codex] replaced with @cometix/codex`);
+  if (isLinux) {
+    stageLinuxResources(platform, sourceDir);
   } else {
-    console.log(`   [!] @cometix/codex vendor not found for ${platform}, keeping upstream`);
+    const vendorCodex = resolveCodexVendor(platform);
+    if (vendorCodex) {
+      const dest = path.join(sourceDir, codexBinName);
+      fs.copyFileSync(vendorCodex, dest);
+      try { fs.chmodSync(dest, 0o755); } catch {}
+      console.log(`   [codex] replaced with @cometix/codex`);
+    } else {
+      console.log(`   [!] @cometix/codex vendor not found for ${platform}, keeping upstream`);
+    }
   }
 
   // 3. For Linux: copy _asar/ content to flat src/ (forge packs ASAR from src/)
@@ -174,6 +329,9 @@ function main() {
     }
     const count = copyRecursive(asarContentDir, SRC);
     console.log(`   [linux] _asar/ -> src/ (${count} files for forge ASAR packing)`);
+    copyNativeSourceModule("better-sqlite3");
+    copyNativeSourceModule("node-pty");
+    stripLinuxMacArtifacts(SRC);
   }
 
   // 4. Sync version to root package.json

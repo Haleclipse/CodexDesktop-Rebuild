@@ -7,6 +7,7 @@ node_modules/
 # Build outputs
 out/
 dist/
+.cache/
 
 # Upstream ASAR extracts and build-time copies (all generated)
 src/

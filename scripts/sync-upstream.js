@@ -71,10 +71,18 @@ function extractArchive(archive, dest) {
     // ditto preserves macOS symlinks + resource forks (required for .app)
     execSync(`ditto -xk "${archive}" "${dest}"`);
   } else {
-    // 7zz for Windows MSIX and Linux (symlinks don't matter — only ASAR content used)
+    // 7zz/7z for Windows MSIX and Linux (symlinks don't matter — only ASAR content used)
     for (const bin of ["7zz", "7z"]) {
       try {
         execSync(`${bin} x -y -o"${dest}" "${archive}"`, { stdio: "pipe" });
+        return;
+      } catch {
+        if (fs.readdirSync(dest).length > 0) return;
+      }
+    }
+    if (archive.endsWith(".zip")) {
+      try {
+        execSync(`unzip -q "${archive}" -d "${dest}"`, { stdio: "pipe" });
         return;
       } catch {
         if (fs.readdirSync(dest).length > 0) return;

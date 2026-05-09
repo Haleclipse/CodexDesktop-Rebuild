@@ -1,6 +1,71 @@
 const { FuseV1Options, FuseVersion } = require("@electron/fuses");
 const path = require("path");
 const fs = require("fs");
+const {
+  copyLinuxExecutable,
+  resolveCodexVendor,
+  resolveRipgrepVendor,
+} = require("./scripts/linux-native-utils");
+
+function hasCommand(command) {
+  const pathEntries = (process.env.PATH || "").split(path.delimiter);
+  return pathEntries.some((entry) => {
+    const candidate = path.join(entry, command);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+function buildMode() {
+  try {
+    return fs.readFileSync(path.join(__dirname, "src", ".build-mode"), "utf-8").trim();
+  } catch {
+    return "upstream-asar";
+  }
+}
+
+function linuxPlatformKey(arch) {
+  return arch === "arm64" ? "linux-arm64" : "linux-x64";
+}
+
+function copyStagedOrResolvedLinuxResource(resourcesPath, platformKey, name, resolver) {
+  const staged = path.join(__dirname, "src", ".linux-resources", platformKey, name);
+  const source = fs.existsSync(staged) ? staged : resolver(platformKey);
+  if (!source) {
+    throw new Error(`Linux ${name} ELF not found for ${platformKey}`);
+  }
+  const dest = path.join(resourcesPath, name);
+  copyLinuxExecutable(source, dest, platformKey, name);
+  console.log(`   [linux] ${name}: ${path.relative(__dirname, source)} -> Resources/${name}`);
+}
+
+function copyLinuxResources(resourcesPath, platformKey) {
+  const stagedDir = path.join(__dirname, "src", ".linux-resources", platformKey);
+  if (!fs.existsSync(stagedDir)) return 0;
+
+  let copied = 0;
+  const copyDir = (sourceDir, destDir) => {
+    fs.mkdirSync(destDir, { recursive: true });
+    for (const entry of fs.readdirSync(sourceDir, { withFileTypes: true })) {
+      if (entry.name === "app.asar" || entry.name === "app.asar.unpacked") continue;
+      const sourcePath = path.join(sourceDir, entry.name);
+      const destPath = path.join(destDir, entry.name);
+      if (entry.isDirectory()) {
+        copyDir(sourcePath, destPath);
+      } else if (!entry.isSymbolicLink()) {
+        fs.copyFileSync(sourcePath, destPath);
+        copied++;
+      }
+    }
+  };
+
+  copyDir(stagedDir, resourcesPath);
+  return copied;
+}
 
 module.exports = {
   packagerConfig: {
@@ -11,16 +76,12 @@ module.exports = {
     // Build mode is set by prepare-src.js via src/.build-mode marker file.
     // "upstream-asar": mac/win — we provide pre-built app.asar, forge skips ASAR packing.
     // "linux": forge packs ASAR from src/ content (needs electron-rebuild).
-    asar: (() => {
-      try {
-        return fs.readFileSync(path.join(__dirname, "src", ".build-mode"), "utf-8").trim() === "upstream-asar"
-          ? false
-          : { unpack: "{**/*.node,**/node-pty/build/Release/spawn-helper,**/node-pty/prebuilds/*/spawn-helper}" };
-      } catch { return false; }
-    })(),
+    asar: (() => buildMode() === "upstream-asar"
+      ? false
+      : { unpack: "{**/*.node,**/node-pty/build/Release/spawn-helper,**/node-pty/prebuilds/*/spawn-helper}" }
+    )(),
     ignore: (() => {
-      let mode = "upstream-asar";
-      try { mode = fs.readFileSync(path.join(__dirname, "src", ".build-mode"), "utf-8").trim(); } catch {}
+      const mode = buildMode();
       return mode === "upstream-asar"
         ? (filePath) => {
             // Allow only package.json + stub main entry (forge validates it)
@@ -72,14 +133,15 @@ module.exports = {
       name: "@electron-forge/maker-deb",
       config: { options: { name: "codex", productName: "Codex", genericName: "AI Coding Assistant", categories: ["Development", "Utility"], bin: "Codex", maintainer: "Cometix Space", homepage: "https://github.com/Haleclipse/CodexDesktop-Rebuild", icon: "./resources/electron.png" } },
     },
-    {
+    ...(!["linux"].includes(process.platform) || hasCommand("rpm") ? [{
       name: "@electron-forge/maker-rpm",
       config: { options: { name: "codex", productName: "Codex", genericName: "AI Coding Assistant", categories: ["Development", "Utility"], bin: "Codex", license: "Apache-2.0", homepage: "https://github.com/Haleclipse/CodexDesktop-Rebuild", icon: "./resources/electron.png" } },
-    },
+    }] : []),
     { name: "@electron-forge/maker-zip", platforms: ["linux"] },
   ],
   plugins: [
-    // No auto-unpack-natives — we provide upstream app.asar.unpacked directly
+    // No auto-unpack-natives: mac/win provide upstream app.asar.unpacked;
+    // Linux uses Forge ASAR packing after electron-rebuild in src/node_modules.
     {
       name: "@electron-forge/plugin-fuses",
       config: {
@@ -94,19 +156,29 @@ module.exports = {
     },
   ],
   hooks: {
-    // Copy everything from the platform dir to the app's Resources:
+    // Copy everything from the platform dir to the app's Resources for mac/win:
     // - app.asar (repacked by prepare-src with patches applied)
     // - app.asar.unpacked/ (upstream native modules, untouched)
     // - All other resources (codex CLI, rg, plugins, native, etc.)
     //
-    // Forge's own ASAR packing is disabled (asar: false).
-    // buildPath points to the app dir — we put app.asar alongside it.
+    // Forge's own ASAR packing is disabled for upstream-asar builds.
+    // Linux must not copy app.asar/app.asar.unpacked from src/mac-*.
     packageAfterCopy: async (config, buildPath, electronVersion, platform, arch) => {
       console.log(`\n-- packageAfterCopy: ${platform}-${arch}`);
 
       const resourcesPath = path.dirname(buildPath);
+
+      if (platform === "linux") {
+        const platformKey = linuxPlatformKey(arch);
+        const copied = copyLinuxResources(resourcesPath, platformKey);
+        console.log(`   [linux] copied ${copied} sanitized resource files`);
+        copyStagedOrResolvedLinuxResource(resourcesPath, platformKey, "codex", resolveCodexVendor);
+        copyStagedOrResolvedLinuxResource(resourcesPath, platformKey, "rg", resolveRipgrepVendor);
+        console.log("   [linux] app.asar/app.asar.unpacked left to Forge output");
+        return;
+      }
+
       const platformKey = platform === "win32" ? "win"
-        : platform === "linux" ? `mac-${arch}`
         : `mac-${arch}`;
 
       const platformDir = path.join(__dirname, "src", platformKey);

@@ -18,14 +18,17 @@
     "build:mac": "npm run build:mac-arm64 && npm run build:mac-x64",
     "build:win-x64": "node scripts/build-from-upstream.js --platform win",
     "build:win": "npm run build:win-x64",
-    "build:linux-x64": "node scripts/prepare-src.js --platform linux-x64 && npm run rebuild:native && rm -rf out && electron-forge make --platform=linux --arch=x64",
-    "build:linux-arm64": "node scripts/prepare-src.js --platform linux-arm64 && npm run rebuild:native && rm -rf out && electron-forge make --platform=linux --arch=arm64",
+    "build:linux-x64": "node scripts/prepare-src.js --platform linux-x64 && node scripts/patch-linux-rendering.js linux-x64 && npm run rebuild:native:linux-x64 && node scripts/prepare-src.js --strip-linux-native-extras && rm -rf out && electron-forge make --platform=linux --arch=x64 && node scripts/validate-linux-package.js --arch x64",
+    "build:linux-arm64": "node scripts/prepare-src.js --platform linux-arm64 && node scripts/patch-linux-rendering.js linux-arm64 && npm run rebuild:native:linux-arm64 && node scripts/prepare-src.js --strip-linux-native-extras && rm -rf out && electron-forge make --platform=linux --arch=arm64 && node scripts/validate-linux-package.js --arch arm64",
     "build:linux": "npm run build:linux-x64 && npm run build:linux-arm64",
     "build:all": "npm run build:mac && npm run build:win && npm run build:linux",
     "sync": "node scripts/sync-upstream.js",
     "check-update": "node scripts/check-update.js",
     "bump-version": "node scripts/bump-version.js",
-    "rebuild:native": "electron-rebuild"
+    "rebuild:native": "electron-rebuild",
+    "rebuild:native:linux-x64": "npm_config_devdir=.cache/electron-gyp electron-rebuild -m src -a x64 -f -o better-sqlite3,node-pty",
+    "rebuild:native:linux-arm64": "npm_config_devdir=.cache/electron-gyp electron-rebuild -m src -a arm64 -f -o better-sqlite3,node-pty",
+    "validate:linux-package": "node scripts/validate-linux-package.js"
   },
   "devDependencies": {
     "@electron-forge/cli": "^7.10.2",
@@ -62,7 +65,7 @@
     "zod": "^4.1.13"
   },
   "codexBuildFlavor": "prod",
-  "codexBuildNumber": "1272",
-  "codexSparkleFeedUrl": "https://persistent.oaistatic.com/codex-app-prod/appcast.xml",
+  "codexBuildNumber": "2575",
+  "codexSparkleFeedUrl": "https://persistent.oaistatic.com/codex-app-prod/appcast-x64.xml",
   "codexSparklePublicKey": "rhcBvttuqDFriyNqwTQJR3L4UT1WjIK4QxtwtwusVic="
 }

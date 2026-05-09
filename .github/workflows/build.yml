@@ -81,7 +81,7 @@ jobs:
           npm ci
       - run: |
           sudo apt-get update
-          sudo apt-get install -y rpm fakeroot dpkg 7zip
+          sudo apt-get install -y build-essential python3 make g++ rpm fakeroot dpkg 7zip file ripgrep
       - run: node scripts/sync-upstream.js --force --skip-win
       - run: node scripts/patch-all.js mac-${{ matrix.arch }}
       - run: npm run build:linux-${{ matrix.arch }}
