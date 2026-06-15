@@ -200,6 +200,24 @@ async function main() {
   const copied = copyLinuxResources(sourcePlatformDir, resourcesPath);
   console.log(`   [ok] ${copied} files copied to ${path.relative(PROJECT_ROOT, resourcesPath)}`);
 
+  // ─── 6b. Strip cross-arch helper binaries ───
+  // Upstream Codex bundles BOTH sky_linux_x64 and sky_linux_arm64. rpmbuild's
+  // brp-strip pass invokes the host's /usr/bin/strip on every ELF in the
+  // payload — on an x86_64 runner that strip can't parse arm64 ELF and the
+  // whole rpm fails. The runtime selector only ever calls the matching arch
+  // binary, so the wrong-arch copy is dead weight; remove it before any
+  // maker runs (also slims deb/zip a bit).
+  const otherArch = arch === "x64" ? "arm64" : "x64";
+  const crossArchBins = [
+    path.join(resourcesPath, "cua_node", "lib", "node_modules", "@oai", "sky", "bin", "linux", `sky_linux_${otherArch}`),
+  ];
+  for (const f of crossArchBins) {
+    if (fs.existsSync(f)) {
+      fs.rmSync(f);
+      console.log(`   [strip-safe] removed cross-arch ${path.relative(packageDir, f)}`);
+    }
+  }
+
   // ─── 7. Run makers ───
   const packageJSON = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, "package.json"), "utf-8"));
   const makeDir = path.join(OUT_DIR, "make");
