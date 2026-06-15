@@ -178,6 +178,9 @@ function main() {
     fs.copyFileSync(vendorCodex, dest);
     try { fs.chmodSync(dest, 0o755); } catch {}
     console.log(`   [codex] replaced with @cometix/codex`);
+  } else if (isLinux) {
+    console.error(`   [x] @cometix/codex vendor not found for ${platform}; refusing to ship upstream macOS Mach-O binary inside a Linux package.`);
+    process.exit(1);
   } else {
     console.log(`   [!] @cometix/codex vendor not found for ${platform}, keeping upstream`);
   }
@@ -191,7 +194,8 @@ function main() {
       try { fs.chmodSync(dest, 0o755); } catch {}
       console.log(`   [rg] replaced with Linux rg from @cometix/codex`);
     } else {
-      console.log(`   [!] Linux rg not found in vendor, keeping upstream (will fail on Linux)`);
+      console.error(`   [x] Linux rg not found in vendor for ${platform}; refusing to ship upstream macOS Mach-O rg inside a Linux package.`);
+      process.exit(1);
     }
   }
 

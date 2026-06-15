@@ -38,6 +38,7 @@ jobs:
         with:
           name: Codex-macOS-${{ matrix.arch }}
           path: out/*.dmg
+          if-no-files-found: error
 
   build-windows:
     if: inputs.platform == 'all' || inputs.platform == 'windows'
@@ -63,6 +64,7 @@ jobs:
         with:
           name: Codex-Windows-x64
           path: out/*.zip
+          if-no-files-found: error
 
   build-linux:
     if: inputs.platform == 'all' || inputs.platform == 'linux'
@@ -81,10 +83,31 @@ jobs:
           npm ci
       - run: |
           sudo apt-get update
-          sudo apt-get install -y rpm fakeroot dpkg 7zip
+          sudo apt-get install -y rpm fakeroot dpkg 7zip build-essential python3 libudev-dev
       - run: node scripts/sync-upstream.js --force --skip-win
       - run: node scripts/patch-all.js mac-${{ matrix.arch }}
       - run: npm run build:linux-${{ matrix.arch }}
+        env:
+          DEBUG: electron-forge:*,electron-packager,@electron/packager*
+      - name: List build output (diagnostic)
+        if: always()
+        run: |
+          echo "::group::out/ tree"
+          ls -la out/ 2>/dev/null || echo "(no out/)"
+          echo "::endgroup::"
+          echo "::group::out/make/ tree"
+          find out/make -maxdepth 5 -type f 2>/dev/null | head -50 || echo "(no out/make/)"
+          echo "::endgroup::"
+          echo "::group::artifact counts"
+          deb_count=$(find out/make/deb -name '*.deb' 2>/dev/null | wc -l)
+          rpm_count=$(find out/make/rpm -name '*.rpm' 2>/dev/null | wc -l)
+          zip_count=$(find out/make/zip -name '*.zip' 2>/dev/null | wc -l)
+          echo "deb=$deb_count rpm=$rpm_count zip=$zip_count"
+          echo "::endgroup::"
+          if [ "$deb_count" -eq 0 ] && [ "$rpm_count" -eq 0 ] && [ "$zip_count" -eq 0 ]; then
+            echo "::error::electron-forge make produced zero distributables (no .deb/.rpm/.zip in out/make/)"
+            exit 1
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: Codex-Linux-${{ matrix.arch }}
@@ -92,3 +115,4 @@ jobs:
             out/make/deb/**/*.deb
             out/make/rpm/**/*.rpm
             out/make/zip/**/*.zip
+          if-no-files-found: error

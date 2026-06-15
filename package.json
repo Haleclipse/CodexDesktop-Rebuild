@@ -18,14 +18,16 @@
     "build:mac": "npm run build:mac-arm64 && npm run build:mac-x64",
     "build:win-x64": "node scripts/build-from-upstream.js --platform win",
     "build:win": "npm run build:win-x64",
-    "build:linux-x64": "node scripts/prepare-src.js --platform linux-x64 && npm run rebuild:native && node scripts/sync-native-modules.js --platform linux-x64 && rm -rf out && electron-forge make --platform=linux --arch=x64",
-    "build:linux-arm64": "node scripts/prepare-src.js --platform linux-arm64 && npm run rebuild:native && node scripts/sync-native-modules.js --platform linux-arm64 && rm -rf out && electron-forge make --platform=linux --arch=arm64",
+    "build:linux-x64": "node scripts/prepare-src.js --platform linux-x64 && npm run rebuild:native:x64 && node scripts/sync-native-modules.js --platform linux-x64 && rm -rf out && electron-forge make --platform=linux --arch=x64",
+    "build:linux-arm64": "node scripts/prepare-src.js --platform linux-arm64 && npm run rebuild:native:arm64 && node scripts/sync-native-modules.js --platform linux-arm64 && rm -rf out && electron-forge make --platform=linux --arch=arm64",
     "build:linux": "npm run build:linux-x64 && npm run build:linux-arm64",
     "build:all": "npm run build:mac && npm run build:win && npm run build:linux",
     "sync": "node scripts/sync-upstream.js",
     "check-update": "node scripts/check-update.js",
     "bump-version": "node scripts/bump-version.js",
-    "rebuild:native": "electron-rebuild"
+    "rebuild:native": "electron-rebuild",
+    "rebuild:native:x64": "electron-rebuild --arch=x64",
+    "rebuild:native:arm64": "electron-rebuild --arch=arm64"
   },
   "devDependencies": {
     "@electron-forge/cli": "^7.10.2",
