@@ -2,10 +2,16 @@
 /**
  * build-from-upstream-linux.js — Build Linux distributables (.deb/.rpm/.zip)
  *
- * Linux has no upstream Codex installer, so unlike mac/win we must build the
- * Electron app from scratch using @electron/packager directly, then invoke
- * maker-deb/rpm/zip programmatically. This bypasses electron-forge make,
- * which exits silently in CI after Packaging without producing artifacts.
+ * Avoids @electron/packager entirely. Its dependency extract-zip 2.0.1
+ * silently exits the Node process during extraction on Node 24 + Ubuntu CI
+ * (no error, no stack — process just ends with exit code 0 mid-await).
+ * Two CI runs reproduced this deterministically with full DEBUG.
+ *
+ * Instead this script does the same work via:
+ *   - @electron/get        — download the Electron Linux template zip
+ *   - system `unzip`       — extract reliably (apt: unzip is preinstalled)
+ *   - @electron/asar       — pack src/ into app.asar
+ *   - maker-deb/rpm/zip    — programmatic make()
  *
  * Prereq: prepare-src.js --platform linux-{arch} has already populated src/
  *         (app code) and src/mac-{arch}/ (Linux codex/rg vendor binaries).
@@ -16,19 +22,14 @@
  */
 const fs = require("fs");
 const path = require("path");
+const { execFileSync } = require("child_process");
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const SRC_DIR = path.join(PROJECT_ROOT, "src");
 const OUT_DIR = path.join(PROJECT_ROOT, "out");
 const RESOURCES_DIR = path.join(PROJECT_ROOT, "resources");
 
-const IGNORE_ALLOWED = [
-  "/src/.vite/build",
-  "/src/webview",
-  "/src/skills",
-  "/src/native-menu-locales",
-  "/src/node_modules",
-];
+const ASAR_UNPACK_GLOB = "{**/*.node,**/node-pty/build/Release/spawn-helper,**/node-pty/prebuilds/*/spawn-helper}";
 
 const MACOS_ONLY_FILES = new Set([
   "node", "node_repl",
@@ -38,21 +39,18 @@ const MACOS_ONLY_FILES = new Set([
 ]);
 const MACOS_ONLY_DIRS = new Set(["native", "app.asar.unpacked"]);
 
-function packagerIgnore(filePath) {
-  if (filePath === "") return false;
-  if (filePath === "/package.json") return false;
-  for (const p of IGNORE_ALLOWED) {
-    if (p.startsWith(filePath) || filePath.startsWith(p)) return false;
-  }
-  return true;
+function readElectronVersion() {
+  const pkg = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, "package.json"), "utf-8"));
+  const raw = pkg.devDependencies?.electron;
+  if (!raw) throw new Error("devDependencies.electron not set in package.json");
+  // strip leading ^ or ~ or = etc.
+  return raw.replace(/^[^\d]*/, "");
 }
 
 function copyLinuxResources(srcDir, destDir) {
   if (!fs.existsSync(srcDir)) {
-    console.log(`   [!] ${srcDir} not found, skipping resource copy`);
-    return 0;
+    throw new Error(`Source platform dir not found: ${srcDir}`);
   }
-  console.log(`-- afterCopy: ${path.relative(PROJECT_ROOT, srcDir)} -> ${path.relative(PROJECT_ROOT, destDir)}`);
   const skip = new Set(["_asar"]);
   for (const f of MACOS_ONLY_FILES) skip.add(f);
   for (const d of MACOS_ONLY_DIRS) skip.add(d);
@@ -63,7 +61,11 @@ function copyLinuxResources(srcDir, destDir) {
     for (const e of fs.readdirSync(s, { withFileTypes: true })) {
       const sp = path.join(s, e.name), dp = path.join(d, e.name);
       if (e.isDirectory()) copyDir(sp, dp);
-      else if (!e.isSymbolicLink()) { fs.copyFileSync(sp, dp); copied++; }
+      else if (!e.isSymbolicLink()) {
+        fs.copyFileSync(sp, dp);
+        try { fs.chmodSync(dp, 0o755); } catch {}
+        copied++;
+      }
     }
   };
   for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
@@ -79,7 +81,6 @@ function copyLinuxResources(srcDir, destDir) {
       copied++;
     }
   }
-  console.log(`   [ok] ${copied} files copied`);
   return copied;
 }
 
@@ -88,7 +89,7 @@ async function runMaker(kind, factory, packageDir, makeDir, targetArch, packageJ
   try {
     const maker = factory();
     if (typeof maker.isSupportedOnCurrentPlatform === "function" && !maker.isSupportedOnCurrentPlatform()) {
-      throw new Error(`maker-${kind} reports unsupported on current platform (missing binary or installer package?)`);
+      throw new Error(`maker-${kind} reports unsupported on current platform (missing peer installer pkg?)`);
     }
     if (typeof maker.ensureExternalBinariesExist === "function") {
       maker.ensureExternalBinariesExist();
@@ -129,42 +130,77 @@ async function main() {
     console.error(`[x] src/ not prepared. Run: node scripts/prepare-src.js --platform ${platform}`);
     process.exit(1);
   }
-
-  console.log(`\n== electron-packager: linux-${arch} ==`);
-  console.log(`   dir:    ${PROJECT_ROOT}`);
-  console.log(`   out:    ${OUT_DIR}`);
-  console.log(`   source: ${sourcePlatformDir}`);
-
-  const { packager } = require("@electron/packager");
-  const packagePaths = await packager({
-    dir: PROJECT_ROOT,
-    out: OUT_DIR,
-    platform: "linux",
-    arch,
-    asar: { unpack: "{**/*.node,**/node-pty/build/Release/spawn-helper,**/node-pty/prebuilds/*/spawn-helper}" },
-    overwrite: true,
-    name: "Codex",
-    executableName: "Codex",
-    appBundleId: "com.openai.codex",
-    icon: path.join(RESOURCES_DIR, "electron.png"),
-    prune: true,
-    ignore: packagerIgnore,
-    afterCopy: [(buildPath, electronVersion, plat, ar, cb) => {
-      try {
-        const resourcesPath = path.dirname(buildPath);
-        copyLinuxResources(sourcePlatformDir, resourcesPath);
-        cb();
-      } catch (err) { cb(err); }
-    }],
-  });
-
-  if (!packagePaths || packagePaths.length === 0) {
-    console.error("[x] @electron/packager returned no package paths");
+  if (!fs.existsSync(sourcePlatformDir)) {
+    console.error(`[x] ${sourcePlatformDir} not found.`);
     process.exit(1);
   }
-  const packageDir = packagePaths[0];
-  console.log(`\n   [ok] packaged at ${packageDir}`);
 
+  const electronVersion = readElectronVersion();
+  const packageDir = path.join(OUT_DIR, `Codex-linux-${arch}`);
+  const resourcesPath = path.join(packageDir, "resources");
+  const appAsarPath = path.join(resourcesPath, "app.asar");
+
+  console.log(`\n== build-linux: ${platform} ==`);
+  console.log(`   electron: v${electronVersion}`);
+  console.log(`   package:  ${packageDir}`);
+  console.log(`   source:   ${path.relative(PROJECT_ROOT, sourcePlatformDir)}`);
+
+  // ─── 1. Download Electron Linux template zip ───
+  console.log(`\n-- downloading electron-v${electronVersion}-linux-${arch}.zip`);
+  const { downloadArtifact, initializeProxy } = require("@electron/get");
+  initializeProxy();
+  const zipPath = await downloadArtifact({
+    version: electronVersion,
+    platform: "linux",
+    arch,
+    artifactName: "electron",
+  });
+  const zipSize = fs.statSync(zipPath).size;
+  console.log(`   [ok] ${zipPath} (${(zipSize / 1024 / 1024).toFixed(1)} MB)`);
+
+  // ─── 2. Extract via system unzip (bypasses extract-zip silent-exit) ───
+  console.log(`\n-- extracting via system unzip -> ${packageDir}`);
+  if (fs.existsSync(packageDir)) fs.rmSync(packageDir, { recursive: true, force: true });
+  fs.mkdirSync(packageDir, { recursive: true });
+  execFileSync("unzip", ["-qq", "-o", zipPath, "-d", packageDir], { stdio: ["ignore", "inherit", "inherit"] });
+  const extractedCount = fs.readdirSync(packageDir).length;
+  console.log(`   [ok] ${extractedCount} top-level entries extracted`);
+  if (extractedCount === 0) throw new Error("unzip produced no files");
+
+  // ─── 3. Rename `electron` binary -> `Codex` ───
+  const electronBin = path.join(packageDir, "electron");
+  const codexBin = path.join(packageDir, "Codex");
+  if (!fs.existsSync(electronBin)) throw new Error(`Electron binary not found at ${electronBin}`);
+  fs.renameSync(electronBin, codexBin);
+  fs.chmodSync(codexBin, 0o755);
+  console.log(`   [ok] electron -> Codex`);
+
+  // ─── 4. Remove default_app + chrome-sandbox SUID (forge does same) ───
+  for (const name of ["default_app.asar", "default_app"]) {
+    const p = path.join(resourcesPath, name);
+    if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
+  }
+
+  // ─── 5. Pack src/ -> app.asar (excludes src/mac-* via root filter) ───
+  console.log(`\n-- packing app.asar from src/`);
+  const asar = require("@electron/asar");
+  await asar.createPackageWithOptions(SRC_DIR, appAsarPath, {
+    unpack: ASAR_UNPACK_GLOB,
+    dot: true,
+    // Exclude src/mac-x64/, src/mac-arm64/, src/win/ subdirs — these are
+    // upstream platform trees retained alongside src/ for the afterCopy
+    // step, not part of the runtime app.
+    globOptions: { ignore: ["mac-x64/**", "mac-arm64/**", "win/**"] },
+  });
+  const asarSize = fs.statSync(appAsarPath).size;
+  console.log(`   [ok] app.asar: ${(asarSize / 1024 / 1024).toFixed(1)} MB`);
+
+  // ─── 6. Copy Linux-specific resources from src/mac-{arch}/ ───
+  console.log(`\n-- copying Linux resources from ${path.relative(PROJECT_ROOT, sourcePlatformDir)}`);
+  const copied = copyLinuxResources(sourcePlatformDir, resourcesPath);
+  console.log(`   [ok] ${copied} files copied to ${path.relative(PROJECT_ROOT, resourcesPath)}`);
+
+  // ─── 7. Run makers ───
   const packageJSON = JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, "package.json"), "utf-8"));
   const makeDir = path.join(OUT_DIR, "make");
   fs.mkdirSync(makeDir, { recursive: true });
@@ -211,20 +247,16 @@ async function main() {
 
   console.log(`\n== summary ==`);
   for (const r of results) {
-    if (r.ok) {
-      console.log(`   [ok]   ${r.kind}: ${r.artifacts.join(", ")}`);
-    } else {
-      console.log(`   [FAIL] ${r.kind}: ${r.error}`);
-    }
+    if (r.ok) console.log(`   [ok]   ${r.kind}: ${r.artifacts.join(", ")}`);
+    else      console.log(`   [FAIL] ${r.kind}: ${r.error}`);
   }
-
   const failed = results.filter(r => !r.ok);
   if (failed.length === results.length) {
     console.error(`\n[x] all makers failed`);
     process.exit(1);
   }
   if (failed.length > 0) {
-    console.error(`\n[!] ${failed.length}/${results.length} makers failed (partial success)`);
+    console.error(`\n[!] ${failed.length}/${results.length} makers failed`);
     process.exit(1);
   }
   console.log(`\n[ok] all ${results.length} makers succeeded`);
