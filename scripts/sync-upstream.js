@@ -207,8 +207,40 @@ async function syncWin(destDir) {
     throw new Error(`Windows: resources dir not found${alt ? `, app.asar at ${alt}` : ""}`);
   }
 
+  // 7z/7zz on Windows leaves URL-encoded names in the MSIX (notably %40 for @
+  // in scoped npm package paths like %40worklouder/...). The asar header
+  // references the originals, so extraction fails when it tries to resolve
+  // unpacked .node binaries. Decode percent-encoded entries in-place.
+  decodePercentNames(path.join(resourcesDir, "app.asar.unpacked"));
+
   assembleOutput(resourcesDir, destDir, "Windows");
   return info;
+}
+
+function decodePercentNames(root) {
+  if (!fs.existsSync(root)) return;
+  let renamed = 0;
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const cur = path.join(dir, e.name);
+      let next = cur;
+      if (/%[0-9A-Fa-f]{2}/.test(e.name)) {
+        try {
+          const decoded = decodeURIComponent(e.name);
+          if (decoded !== e.name) {
+            next = path.join(dir, decoded);
+            fs.renameSync(cur, next);
+            renamed++;
+          }
+        } catch {
+          /* keep as-is on malformed sequences */
+        }
+      }
+      if (e.isDirectory()) walk(next);
+    }
+  };
+  walk(root);
+  if (renamed) console.log(`   [decode] renamed ${renamed} percent-encoded path(s)`);
 }
 
 // ─── Assemble output ────────────────────────────────────────────
@@ -286,11 +318,21 @@ async function main() {
   }
 
   if (!SKIP_WIN) {
-    try {
-      const winInfo = await getWindowsVersion();
-      console.log(`   win:       ${winInfo.version}`);
-      results.win = winInfo;
-    } catch (e) { console.error(`   [x] win check: ${e.message}`); }
+    const MAX_TRIES = 4;
+    for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+      try {
+        const winInfo = await getWindowsVersion();
+        console.log(`   win:       ${winInfo.version}`);
+        results.win = winInfo;
+        break;
+      } catch (e) {
+        const last = attempt === MAX_TRIES;
+        console.error(
+          `   [x] win check (attempt ${attempt}/${MAX_TRIES}): ${e.message}${last ? "" : " — retrying"}`,
+        );
+        if (!last) await new Promise((r) => setTimeout(r, attempt * 2000));
+      }
+    }
   }
 
   if (CHECK_ONLY) {

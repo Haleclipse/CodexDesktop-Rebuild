@@ -103,8 +103,8 @@ function main() {
   });
 
   if (bundles.length === 0) {
-    console.error("[x] No main bundle found");
-    process.exit(1);
+    console.log("[skip] No main bundle found (sync-upstream did not populate src/)");
+    return;
   }
 
   for (const bundle of bundles) {
