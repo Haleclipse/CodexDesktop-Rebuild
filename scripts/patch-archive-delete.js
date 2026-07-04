@@ -17,7 +17,7 @@ const { locateBundles, relPath } = require("./patch-util");
 
 // ─── Layer 1: app-main route injection ──────────────────────────
 
-function patchAppMain(bundles) {
+function patchAppMain(bundles, isCheck) {
   let patched = 0;
   for (const bundle of bundles) {
     const code = fs.readFileSync(bundle.path, "utf-8");
@@ -47,6 +47,15 @@ function patchAppMain(bundles) {
 
     const inject = `,${q}delete-conversation${q}:${wrapperFn}(async(${mgrVar},{conversationId:${cidVar}})=>{await ${mgrVar}.sendRequest(${q}thread/delete${q},{threadId:${cidVar}})})`;
     const newCode = code.slice(0, anchorEnd) + inject + code.slice(anchorEnd);
+
+    if (isCheck) {
+      console.log(
+        `  [?] ${relPath(bundle.path)}: would inject delete-conversation route (wrapper=${wrapperFn})`,
+      );
+      patched++;
+      continue;
+    }
+
     fs.writeFileSync(bundle.path, newCode);
     console.log(`  [ok] ${relPath(bundle.path)}: injected delete-conversation route (wrapper=${wrapperFn})`);
     patched++;
@@ -56,7 +65,7 @@ function patchAppMain(bundles) {
 
 // ─── Layer 2: data-controls delete button injection ─────────────
 
-function patchDataControls(bundles) {
+function patchDataControls(bundles, isCheck) {
   let patched = 0;
   for (const bundle of bundles) {
     const code = fs.readFileSync(bundle.path, "utf-8");
@@ -256,6 +265,15 @@ function patchDataControls(bundles) {
     const newArray = `[${contentVar},${deleteBtn},${unarchiveBtnVar}]`;
     const newCode = code.slice(0, childrenArrayStart) + newArray + code.slice(childrenArrayEnd);
 
+    if (isCheck) {
+      console.log(
+        `  [?] ${relPath(bundle.path)}: would inject delete button` +
+        ` (thread=${threadVar} host=${hostIdVar} qc=${queryClientVar} btn=${btnComponent})`,
+      );
+      patched++;
+      continue;
+    }
+
     fs.writeFileSync(bundle.path, newCode);
     console.log(
       `  [ok] ${relPath(bundle.path)}: injected delete button` +
@@ -270,6 +288,7 @@ function patchDataControls(bundles) {
 
 function main() {
   const args = process.argv.slice(2);
+  const isCheck = args.includes("--check");
   const platform = args.find((a) =>
     ["mac-arm64", "mac-x64", "win"].includes(a),
   );
@@ -280,7 +299,7 @@ function main() {
     pattern: /^app-main-.*\.js$/,
     ...(platform ? { platform } : {}),
   });
-  const routePatched = patchAppMain(appMainBundles);
+  const routePatched = patchAppMain(appMainBundles, isCheck);
 
   console.log("  [layer 2] data-controls: delete button");
   const dataControlsBundles = locateBundles({
@@ -288,7 +307,7 @@ function main() {
     pattern: /^data-controls-.*\.js$/,
     ...(platform ? { platform } : {}),
   });
-  const btnPatched = patchDataControls(dataControlsBundles);
+  const btnPatched = patchDataControls(dataControlsBundles, isCheck);
 
   console.log(`  [done] routes: ${routePatched}, buttons: ${btnPatched}`);
 }

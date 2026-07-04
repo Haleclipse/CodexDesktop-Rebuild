@@ -13,7 +13,7 @@
  * Fallback: index-*.js (older builds)
  *
  * Usage:
- *   node scripts/patch-statsig-logger.js [platform]   # Apply patch (unix/win/omit=both)
+ *   node scripts/patch-statsig-logger.js [platform]   # mac-arm64 | mac-x64 | win | omit=all
  *   node scripts/patch-statsig-logger.js --check      # Dry-run: report matches
  */
 const fs = require("fs");
@@ -165,7 +165,9 @@ function locateTargets(platform) {
 function main() {
   const args = process.argv.slice(2);
   const isCheck = args.includes("--check");
-  const platform = args.find((a) => a === "unix" || a === "win");
+  const platform = args.find((a) =>
+    ["mac-arm64", "mac-x64", "win"].includes(a),
+  );
 
   const bundles = locateTargets(platform);
 

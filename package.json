@@ -12,7 +12,7 @@
     "patch:win": "node scripts/patch-all.js win",
     "forge:package": "electron-forge package",
     "forge:make": "electron-forge make",
-    "build": "npm run build:mac-arm64",
+    "build": "node scripts/build-current.js",
     "build:mac-arm64": "node scripts/build-from-upstream.js --platform mac-arm64",
     "build:mac-x64": "node scripts/build-from-upstream.js --platform mac-x64",
     "build:mac": "npm run build:mac-arm64 && npm run build:mac-x64",
@@ -46,7 +46,7 @@
   "dependencies": {
     "@sentry/electron": "^7.5.0",
     "@sentry/node": "10.29.0",
-    "better-sqlite3": "^12.4.6",
+    "better-sqlite3": "^12.11.1",
     "electron-context-menu": "^4.1.1",
     "electron-squirrel-startup": "^1.0.1",
     "encoding": "^0.1.13",

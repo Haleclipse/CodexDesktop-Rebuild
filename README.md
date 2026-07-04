@@ -54,8 +54,8 @@ npm run dev
 ## CI/CD
 
 GitHub Actions automatically builds on:
-- Push to `master`
-- Tag `v*` → Creates draft release
+- Push to `master` / `main` and tag `v*` → build artifacts
+- Daily upstream sync workflow → downloads upstream, reapplies patches, builds, and creates a draft release when a newer upstream version is detected
 
 ## Credits
 

@@ -2,6 +2,21 @@ const { FuseV1Options, FuseVersion } = require("@electron/fuses");
 const path = require("path");
 const fs = require("fs");
 
+const githubRepository = process.env.GITHUB_REPOSITORY || "";
+const githubRefName = process.env.GITHUB_REF_NAME || "master";
+const repositoryUrl =
+  process.env.CODEX_REPOSITORY_URL ||
+  (githubRepository ? `https://github.com/${githubRepository}` : undefined);
+const remoteIconUrl =
+  process.env.CODEX_ICON_URL ||
+  (githubRepository
+    ? `https://raw.githubusercontent.com/${githubRepository}/${githubRefName}/resources/electron.ico`
+    : undefined);
+
+function withRepositoryHomepage(options) {
+  return repositoryUrl ? { ...options, homepage: repositoryUrl } : options;
+}
+
 module.exports = {
   packagerConfig: {
     name: "Codex",
@@ -64,17 +79,17 @@ module.exports = {
         authors: "OpenAI, Cometix Space",
         description: "Codex Desktop App",
         setupIcon: "./resources/electron.ico",
-        iconUrl: "https://raw.githubusercontent.com/Haleclipse/CodexDesktop-Rebuild/master/resources/electron.ico",
+        ...(remoteIconUrl ? { iconUrl: remoteIconUrl } : {}),
       },
     },
     { name: "@electron-forge/maker-zip", platforms: ["win32"] },
     {
       name: "@electron-forge/maker-deb",
-      config: { options: { name: "codex", productName: "Codex", genericName: "AI Coding Assistant", categories: ["Development", "Utility"], bin: "Codex", maintainer: "Cometix Space", homepage: "https://github.com/Haleclipse/CodexDesktop-Rebuild", icon: "./resources/electron.png" } },
+      config: { options: withRepositoryHomepage({ name: "codex", productName: "Codex", genericName: "AI Coding Assistant", categories: ["Development", "Utility"], bin: "Codex", maintainer: "Cometix Space", icon: "./resources/electron.png" }) },
     },
     {
       name: "@electron-forge/maker-rpm",
-      config: { options: { name: "codex", productName: "Codex", genericName: "AI Coding Assistant", categories: ["Development", "Utility"], bin: "Codex", license: "Apache-2.0", homepage: "https://github.com/Haleclipse/CodexDesktop-Rebuild", icon: "./resources/electron.png" } },
+      config: { options: withRepositoryHomepage({ name: "codex", productName: "Codex", genericName: "AI Coding Assistant", categories: ["Development", "Utility"], bin: "Codex", license: "Apache-2.0", icon: "./resources/electron.png" }) },
     },
     { name: "@electron-forge/maker-zip", platforms: ["linux"] },
   ],
@@ -129,13 +144,29 @@ module.exports = {
         for (const d of MACOS_ONLY_DIRS) skip.add(d);
       }
       let copied = 0;
+      let skippedForeignArch = 0;
+
+      // @oai/sky ships Linux binaries for multiple CPU architectures.
+      // rpm's brp-strip runs target-arch strip over every executable in the package;
+      // leaving the foreign one inside the RPM makes linux-x64 fail on sky_linux_arm64
+      // (and vice versa for arm64).
+      const shouldSkipForeignLinuxBinary = (name) => {
+        if (!isLinux) return false;
+        if (arch === "x64" && name === "sky_linux_arm64") return true;
+        if (arch === "arm64" && name === "sky_linux_x64") return true;
+        return false;
+      };
 
       const copyDir = (s, d) => {
         fs.mkdirSync(d, { recursive: true });
         for (const e of fs.readdirSync(s, { withFileTypes: true })) {
           const sp = path.join(s, e.name), dp = path.join(d, e.name);
           if (e.isDirectory()) copyDir(sp, dp);
-          else if (!e.isSymbolicLink()) { fs.copyFileSync(sp, dp); copied++; }
+          else if (!e.isSymbolicLink()) {
+            if (shouldSkipForeignLinuxBinary(e.name)) { skippedForeignArch++; continue; }
+            fs.copyFileSync(sp, dp);
+            copied++;
+          }
         }
       };
 
@@ -149,6 +180,7 @@ module.exports = {
         if (entry.isDirectory()) {
           copyDir(srcPath, destPath);
         } else if (!entry.isSymbolicLink()) {
+          if (shouldSkipForeignLinuxBinary(entry.name)) { skippedForeignArch++; continue; }
           fs.copyFileSync(srcPath, destPath);
           try { fs.chmodSync(destPath, 0o755); } catch {}
           copied++;
@@ -156,6 +188,7 @@ module.exports = {
       }
 
       console.log(`   [ok] ${copied} files (app.asar + unpacked + resources)`);
+      if (skippedForeignArch) console.log(`   [ok] skipped ${skippedForeignArch} foreign-arch Linux binaries`);
     },
   },
 };

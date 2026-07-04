@@ -8,16 +8,23 @@ on:
       force:
         description: "Force sync even without version change"
         type: boolean
-        default: false
 
 env:
   NODE_VERSION: "24"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
     outputs:
       has_update: ${{ steps.detect.outputs.has_update }}
+      latest_version: ${{ steps.detect.outputs.latest_version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -34,18 +41,39 @@ jobs:
       - name: Check upstream versions
         id: detect
         run: |
-          set +e
-          node scripts/check-update.js --json --force 2>&1
-          exit_code=$?
-          set -e
+          RESULT="$(node scripts/check-update.js --json --force)"
+          echo "$RESULT" > /tmp/codex-version-check.json
 
-          if [ "${{ inputs.force }}" = "true" ]; then
+          LATEST_VERSION="$(node -e "
+            const fs = require('fs');
+            const result = JSON.parse(fs.readFileSync('/tmp/codex-version-check.json', 'utf8'));
+            const platforms = Object.values(result.platforms || {});
+            const first = platforms.find((p) => p && p.version);
+            process.stdout.write(first?.version || '');
+          ")"
+
+          HAS_UPDATE="$(node -e "
+            const fs = require('fs');
+            const result = JSON.parse(fs.readFileSync('/tmp/codex-version-check.json', 'utf8'));
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            const normalize = (version) => String(version || '').replace(/\\.0$/, '');
+            const current = normalize(pkg.version);
+            const platforms = Object.values(result.platforms || {});
+            const versions = platforms.map((p) => normalize(p.version)).filter(Boolean);
+            process.stdout.write(versions.some((v) => v !== current) ? 'true' : 'false');
+          ")"
+
+          echo "latest_version=$LATEST_VERSION" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name == 'workflow_dispatch' && inputs.force }}" = "true" ]; then
             echo "has_update=true" >> "$GITHUB_OUTPUT"
-          elif [ $exit_code -eq 0 ]; then
+            echo "Manual force sync requested."
+          elif [ "$HAS_UPDATE" = "true" ]; then
             echo "has_update=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream update detected: ${LATEST_VERSION}"
           else
             echo "has_update=false" >> "$GITHUB_OUTPUT"
-            echo "No upstream update detected."
+            echo "No upstream update detected. Current package.json version already matches upstream."
           fi
 
   # ──────────────────────────────────────────────
@@ -158,7 +186,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y rpm fakeroot dpkg 7zip
+          sudo apt-get install -y rpm fakeroot dpkg 7zip unzip
 
       - name: Install dependencies
         run: |
@@ -187,8 +215,13 @@ jobs:
   # Bump version + tag + release
   # ──────────────────────────────────────────────
   release:
-    needs: [build-mac, build-windows, build-linux]
-    if: always() && needs.check.result == 'success'
+    needs: [check, build-mac, build-windows, build-linux]
+    if: >-
+      always() &&
+      needs.check.result == 'success' &&
+      needs.check.outputs.has_update == 'true' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -266,6 +299,6 @@ jobs:
             artifacts/**/*.deb
             artifacts/**/*.rpm
             artifacts/**/*.exe
-          draft: true
+          draft: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

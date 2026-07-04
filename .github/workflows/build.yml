@@ -1,21 +1,33 @@
-name: Build & Release (Manual)
+name: Build Artifacts
 
 on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
   workflow_dispatch:
     inputs:
       platform:
         description: "Target platform"
-        required: false
-        default: "all"
+        required: true
         type: choice
         options: [all, mac, windows, linux]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   NODE_VERSION: "24"
 
 jobs:
   build-mac:
-    if: inputs.platform == 'all' || inputs.platform == 'mac'
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'mac' }}
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -40,7 +52,7 @@ jobs:
           path: out/*.dmg
 
   build-windows:
-    if: inputs.platform == 'all' || inputs.platform == 'windows'
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'windows' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -65,7 +77,7 @@ jobs:
           path: out/*.zip
 
   build-linux:
-    if: inputs.platform == 'all' || inputs.platform == 'linux'
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -81,7 +93,7 @@ jobs:
           npm ci
       - run: |
           sudo apt-get update
-          sudo apt-get install -y rpm fakeroot dpkg 7zip
+          sudo apt-get install -y rpm fakeroot dpkg 7zip unzip
       - run: node scripts/sync-upstream.js --force --skip-win
       - run: node scripts/patch-all.js mac-${{ matrix.arch }}
       - run: npm run build:linux-${{ matrix.arch }}
