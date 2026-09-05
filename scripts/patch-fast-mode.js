@@ -2,35 +2,64 @@
 /**
  * Post-build patch: Force-enable Fast mode (speed selector)
  *
- * The speed selector is gated by authMethod === "chatgpt" checks.
- * API-key users never see it because their authMethod differs.
+ * The speed selector and request-time service_tier plumbing are gated by
+ * authMethod === "chatgpt" checks. API-key users never see/use it because
+ * their authMethod differs.
  *
- * This patch locates BinaryExpression nodes matching:
+ * This patch locates BinaryExpression nodes matching the old gate:
  *   X.authMethod !== "chatgpt"
  * inside functions that also reference "fast_mode", and replaces
  * the comparison with !1 (always false), removing the auth gate.
  *
- * Target: permissions-mode-helpers-*.js (or any chunk with the pattern)
+ * It also handles the newer gate shape:
+ *   X.authMethod === "chatgpt"
+ *   authMethod === "chatgpt"
+ * inside fast_mode functions, and expands it to also allow "apikey".
+ *
+ * Target: chunks containing "fast_mode" + "chatgpt".
  */
 const fs = require("fs");
 const path = require("path");
 const { parse } = require("acorn");
 const { locateBundles, relPath, SRC_DIR } = require("./patch-util");
 
-function walk(node, visitor) {
+function walk(node, visitor, parent = null) {
   if (!node || typeof node !== "object") return;
-  if (node.type) visitor(node);
+  if (node.type) visitor(node, parent);
   for (const key of Object.keys(node)) {
     if (key === "type" || key === "start" || key === "end") continue;
     const child = node[key];
     if (Array.isArray(child)) {
       for (const item of child) {
-        if (item && typeof item === "object" && item.type) walk(item, visitor);
+        if (item && typeof item === "object" && item.type)
+          walk(item, visitor, node);
       }
     } else if (child && typeof child === "object" && child.type) {
-      walk(child, visitor);
+      walk(child, visitor, node);
     }
   }
+}
+
+function isChatGptLiteral(node) {
+  return (
+    (node.type === "Literal" && node.value === "chatgpt") ||
+    (node.type === "TemplateLiteral" &&
+      node.expressions.length === 0 &&
+      node.quasis.length === 1 &&
+      node.quasis[0].value.cooked === "chatgpt")
+  );
+}
+
+function expressionSourceForApiKeySide(binary, source) {
+  if (isChatGptLiteral(binary.right)) return source.slice(binary.left.start, binary.left.end);
+  if (isChatGptLiteral(binary.left)) return source.slice(binary.right.start, binary.right.end);
+  return null;
+}
+
+function isAlreadyExpandedToApiKey(parent, source) {
+  if (!parent || parent.type !== "LogicalExpression" || parent.operator !== "||")
+    return false;
+  return source.slice(parent.start, parent.end).includes("apikey");
 }
 
 function collectPatches(ast, source) {
@@ -45,28 +74,51 @@ function collectPatches(ast, source) {
     if (!isFn) return;
 
     const fnSrc = source.slice(node.start, node.end);
-    if (!fnSrc.includes("authMethod") || !fnSrc.includes("fast_mode")) return;
+    if (!fnSrc.includes("fast_mode") || !fnSrc.includes("chatgpt")) return;
 
-    // Inside this function, find: X.authMethod !== `chatgpt`
-    walk(node, (child) => {
-      if (child.type !== "BinaryExpression" || child.operator !== "!==") return;
+    walk(node, (child, parent) => {
+      if (child.type !== "BinaryExpression") return;
 
       const childSrc = source.slice(child.start, child.end);
-      if (!childSrc.includes("authMethod") || !childSrc.includes("chatgpt"))
+
+      // Old shape: X.authMethod !== "chatgpt" gates the fast-mode selector.
+      if (child.operator === "!==") {
+        if (!childSrc.includes("authMethod") || !childSrc.includes("chatgpt"))
+          return;
+
+        if (childSrc === "!1") return;
+
+        // Avoid duplicate patches at same offset
+        if (patches.some((p) => p.start === child.start)) return;
+
+        patches.push({
+          id: "fast_mode_auth_gate",
+          start: child.start,
+          end: child.end,
+          replacement: "!1",
+          original: childSrc,
+        });
         return;
+      }
 
-      if (childSrc === "!1") return;
+      // New shape: authMethod === "chatgpt" or authKind === "chatgpt".
+      // Expand it to allow API-key auth as well.
+      if (child.operator === "===") {
+        const apiKeySide = expressionSourceForApiKeySide(child, source);
+        if (apiKeySide == null) return;
+        if (isAlreadyExpandedToApiKey(parent, source)) return;
 
-      // Avoid duplicate patches at same offset
-      if (patches.some((p) => p.start === child.start)) return;
+        // Avoid duplicate patches at same offset
+        if (patches.some((p) => p.start === child.start)) return;
 
-      patches.push({
-        id: "fast_mode_auth_gate",
-        start: child.start,
-        end: child.end,
-        replacement: "!1",
-        original: childSrc,
-      });
+        patches.push({
+          id: "fast_mode_api_auth_gate",
+          start: child.start,
+          end: child.end,
+          replacement: `${childSrc}||${apiKeySide}===\`apikey\``,
+          original: childSrc,
+        });
+      }
     });
   });
 
@@ -94,7 +146,7 @@ function main() {
       if (!f.endsWith(".js")) continue;
       const fp = path.join(assetsDir, f);
       const src = fs.readFileSync(fp, "utf-8");
-      if (src.includes("authMethod") && src.includes("fast_mode")) {
+      if (src.includes("chatgpt") && src.includes("fast_mode")) {
         targets.push({ platform: plat, path: fp });
       }
     }
@@ -106,6 +158,7 @@ function main() {
   }
 
   let totalPatched = 0;
+  let totalFound = 0;
 
   for (const bundle of targets) {
     const source = fs.readFileSync(bundle.path, "utf-8");
@@ -121,6 +174,7 @@ function main() {
     const patches = collectPatches(ast, source);
 
     if (patches.length === 0) continue;
+    totalFound += patches.length;
 
     console.log(
       `  [${bundle.platform}] ${relPath(bundle.path)} (parse ${Date.now() - t0}ms)`,
@@ -147,6 +201,8 @@ function main() {
 
   if (totalPatched > 0) {
     console.log(`  [ok] ${totalPatched} auth gate(s) removed`);
+  } else if (isCheck && totalFound > 0) {
+    console.log(`  [check] ${totalFound} auth gate(s) would be patched`);
   } else {
     console.log("  [ok] fast_mode auth gates already patched or absent");
   }
