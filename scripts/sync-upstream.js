@@ -6,7 +6,7 @@
  *   src/{platform}/
  *     _asar/              Extracted app.asar content (patch target)
  *     app.asar.unpacked/  Native modules (kept as-is from upstream)
- *     codex|codex.exe     CLI binary (will be replaced by @cometix/codex)
+ *     codex|codex.exe     CLI binary (Windows keeps upstream; Linux uses @cometix/codex later)
  *     rg|rg.exe           ripgrep binary (kept from upstream)
  *     plugins/            Bundled plugins
  *     native/             Platform native modules
@@ -21,7 +21,7 @@ const tls = require("tls");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
-const { execSync } = require("child_process");
+const { execSync, execFileSync } = require("child_process");
 
 // TLS certs for MS delivery CDN
 const certsDir = path.join(__dirname, "certs");
@@ -80,6 +80,25 @@ function extractArchive(archive, dest) {
         if (fs.readdirSync(dest).length > 0) return;
       }
     }
+
+    if (process.platform === "win32" && /\.(msix|zip)$/i.test(archive)) {
+      try {
+        execFileSync("powershell", [
+          "-NoProfile",
+          "-ExecutionPolicy", "Bypass",
+          "-Command",
+          "& { param($archive, $dest) " +
+            "Add-Type -AssemblyName System.IO.Compression.FileSystem; " +
+            "[System.IO.Compression.ZipFile]::ExtractToDirectory($archive, $dest) }",
+          archive,
+          dest,
+        ], { stdio: "pipe" });
+        return;
+      } catch {
+        if (fs.readdirSync(dest).length > 0) return;
+      }
+    }
+
     throw new Error(`Failed to extract ${archive}`);
   }
 }
@@ -93,7 +112,31 @@ function findFile(dir, name) {
   return null;
 }
 
+function findExistingPathCaseInsensitive(p) {
+  if (fs.existsSync(p)) return p;
+
+  const parsed = path.parse(p);
+  let current = parsed.root;
+  const rest = path.relative(parsed.root, p);
+  if (!rest || rest.startsWith("..")) return p;
+
+  for (const part of rest.split(/[\\/]+/)) {
+    if (!part) continue;
+    let entries;
+    try {
+      entries = fs.readdirSync(current);
+    } catch {
+      return p;
+    }
+    const match = entries.find((entry) => entry.toLowerCase() === part.toLowerCase());
+    if (!match) return p;
+    current = path.join(current, match);
+  }
+  return fs.existsSync(current) ? current : p;
+}
+
 function copyRecursive(src, dest) {
+  src = findExistingPathCaseInsensitive(src);
   fs.mkdirSync(dest, { recursive: true });
   let count = 0;
   for (const e of fs.readdirSync(src, { withFileTypes: true })) {
@@ -117,6 +160,103 @@ function countFiles(dir) {
     else n++;
   }
   return n;
+}
+
+function encodeScopedPackagePath(relPath) {
+  return relPath
+    .split(/[\\/]+/)
+    .map((part) => part.startsWith("@") ? `%40${part.slice(1)}` : part)
+    .join(path.sep);
+}
+
+function resolveUnpackedFile(unpackedRoot, relPath) {
+  const direct = path.join(unpackedRoot, relPath);
+  if (fs.existsSync(direct)) return direct;
+
+  const directCase = findExistingPathCaseInsensitive(direct);
+  if (fs.existsSync(directCase)) return directCase;
+
+  // Windows Store MSIX extraction can percent-encode scoped package folders:
+  //   @worklouder -> %40worklouder
+  //   @serialport -> %40serialport
+  const encoded = path.join(unpackedRoot, encodeScopedPackagePath(relPath));
+  if (fs.existsSync(encoded)) return encoded;
+
+  const encodedCase = findExistingPathCaseInsensitive(encoded);
+  return fs.existsSync(encodedCase) ? encodedCase : null;
+}
+
+function extractAsarForPatching(asarPath, asarDest) {
+  const asar = require("@electron/asar");
+  const { header, headerSize } = asar.getRawHeader(asarPath);
+  const fd = fs.openSync(asarPath, "r");
+  const unpackedRoot = `${asarPath}.unpacked`;
+  let packedCount = 0;
+  let unpackedCount = 0;
+  let unpackedMissingCount = 0;
+
+  // ASAR layout: 8-byte pickle header + header JSON + packed file payload.
+  const dataStart = 8 + headerSize;
+
+  try {
+    const visit = (node, relPath) => {
+      if (node.files) {
+        fs.mkdirSync(path.join(asarDest, relPath), { recursive: true });
+        for (const [name, child] of Object.entries(node.files)) {
+          visit(child, path.join(relPath, name));
+        }
+        return;
+      }
+
+      const dest = path.join(asarDest, relPath);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+
+      if (node.link) {
+        const linkTarget = path.join(asarDest, node.link);
+        if (path.relative(asarDest, linkTarget).startsWith("..")) {
+          throw new Error(`ASAR link escapes output: ${relPath} -> ${node.link}`);
+        }
+        try { fs.unlinkSync(dest); } catch {}
+        fs.symlinkSync(path.relative(path.dirname(dest), linkTarget), dest);
+        return;
+      }
+
+      const size = Number(node.size || 0);
+      if (node.unpacked) {
+        const unpackedFile = resolveUnpackedFile(unpackedRoot, relPath);
+        if (unpackedFile) {
+          fs.copyFileSync(unpackedFile, dest);
+          unpackedCount++;
+        } else {
+          // Keep the tree complete so patch scripts can still run, but surface
+          // the mismatch in the summary.
+          fs.writeFileSync(dest, Buffer.alloc(0));
+          unpackedMissingCount++;
+        }
+      } else if (size <= 0) {
+        fs.writeFileSync(dest, Buffer.alloc(0));
+        packedCount++;
+      } else {
+        const buf = Buffer.alloc(size);
+        fs.readSync(fd, buf, 0, size, dataStart + Number(node.offset || 0));
+        fs.writeFileSync(dest, buf);
+        packedCount++;
+      }
+
+      if (node.executable) {
+        try { fs.chmodSync(dest, 0o755); } catch {}
+      }
+    };
+
+    visit({ files: header.files }, "");
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  console.log(`   [asar extract] ${packedCount} packed files, ${unpackedCount} unpacked files`);
+  if (unpackedMissingCount > 0) {
+    console.log(`   [!] ${unpackedMissingCount} unpacked files were missing and replaced with stubs`);
+  }
 }
 
 // ─── Version detection ──────────────────────────────────────────
@@ -223,7 +363,7 @@ function assembleOutput(resourcesDir, destDir, label) {
   // 1. Extract app.asar → _asar/ (for patching)
   const asarDest = path.join(destDir, "_asar");
   console.log("   [asar extract] -> _asar/");
-  execSync(`npx asar extract "${asarPath}" "${asarDest}"`);
+  extractAsarForPatching(asarPath, asarDest);
 
   // 2. Copy app.asar.unpacked/ as-is (native modules)
   const unpackedSrc = path.join(resourcesDir, "app.asar.unpacked");
