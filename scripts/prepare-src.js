@@ -76,6 +76,25 @@ function ensureVendorExtracted(platform) {
   // 2. Try old-style vendor
   const oldPath = path.join(PROJECT_ROOT, "node_modules", "@cometix", "codex", "vendor", triple);
   if (fs.existsSync(oldPath)) { _vendorRootCache = oldPath; return oldPath; }
+  // openai/codex#28224: CLI versions < 0.142.0 let ~/.codex/logs_2.sqlite grow
+  // unbounded (2 GB+ disk burn). Never vendor an older CLI.
+  const MIN_CODEX_VERSION = "0.142.0";
+
+  function compareVersion(a, b) {
+    const pa = a.split("-")[0].split(".").map(Number);
+    const pb = b.split("-")[0].split(".").map(Number);
+    for (let i = 0; i < 3; i++) {
+      const d = (pa[i] || 0) - (pb[i] || 0);
+      if (d !== 0) return d;
+    }
+    return 0;
+  }
+
+  function assertMinCodexVersion(ver) {
+    if (compareVersion(ver, MIN_CODEX_VERSION) < 0) {
+      throw new Error(`@cometix/codex ${ver} is older than ${MIN_CODEX_VERSION}, which fixed the logs_2.sqlite disk-burn bug (openai/codex#28224). Refusing to vendor a buggy CLI; upgrade @cometix/codex first.`);
+    }
+  }
 
   // 3. npm pack platform package
   const PLAT_SUFFIX = {
@@ -90,6 +109,7 @@ function ensureVendorExtracted(platform) {
     baseVer = execSync("npm view @cometix/codex version", { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
   } catch { return null; }
 
+  assertMinCodexVersion(baseVer);
   const spec = `@cometix/codex@${baseVer}-${suffix}`;
   console.log(`   [vendor] fetching ${spec} via npm pack...`);
   const tmpDir = path.join(require("os").tmpdir(), "cometix-codex-pack");
