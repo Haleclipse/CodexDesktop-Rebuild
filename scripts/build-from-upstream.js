@@ -66,6 +66,25 @@ function resolveCodexVendor(platform) {
   if (fs.existsSync(localPath)) return localPath;
 
   // npm pack fallback — fetch platform-specific package
+  // openai/codex#28224: CLI versions < 0.142.0 let ~/.codex/logs_2.sqlite grow
+  // unbounded (2 GB+ disk burn). Never vendor an older CLI.
+  const MIN_CODEX_VERSION = "0.142.0";
+
+  function compareVersion(a, b) {
+    const pa = a.split("-")[0].split(".").map(Number);
+    const pb = b.split("-")[0].split(".").map(Number);
+    for (let i = 0; i < 3; i++) {
+      const d = (pa[i] || 0) - (pb[i] || 0);
+      if (d !== 0) return d;
+    }
+    return 0;
+  }
+
+  function assertMinCodexVersion(ver) {
+    if (compareVersion(ver, MIN_CODEX_VERSION) < 0) {
+      throw new Error(`@cometix/codex ${ver} is older than ${MIN_CODEX_VERSION}, which fixed the logs_2.sqlite disk-burn bug (openai/codex#28224). Refusing to vendor a buggy CLI; upgrade @cometix/codex first.`);
+    }
+  }
   // First get latest cometix base version, then append platform suffix
   const PLAT_SUFFIX = {
     "mac-arm64": "darwin-arm64", "mac-x64": "darwin-x64",
@@ -80,6 +99,7 @@ function resolveCodexVendor(platform) {
     baseVer = execSync("npm view @cometix/codex version", { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
   } catch { return null; }
 
+  assertMinCodexVersion(baseVer);
   // e.g. "0.128.0-cometix" → "@cometix/codex@0.128.0-cometix-darwin-x64"
   const platPkgSpec = `@cometix/codex@${baseVer}-${suffix}`;
   console.log(`   [codex] fetching ${platPkgSpec} via npm pack...`);
